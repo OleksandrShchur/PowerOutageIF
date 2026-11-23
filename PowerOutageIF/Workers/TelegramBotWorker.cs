@@ -33,7 +33,7 @@ public class TelegramBotWorker : BackgroundService
         var token = _configuration["BotSettings:BotToken"];
         if (string.IsNullOrWhiteSpace(token) || token.Contains("YOUR_TELEGRAM_BOT_TOKEN_HERE"))
         {
-            _logger.LogWarning("⚠️ Токен Telegram-бота не налаштовано в appsettings.json! Бот очікує валідний токен.");
+            _logger.LogWarning("⚠️ Токен Telegram-бота не налаштовано в appsettings.json! Очікується валідний токен.");
             return;
         }
 
@@ -42,7 +42,7 @@ public class TelegramBotWorker : BackgroundService
             var me = await _botClient.GetMe(cancellationToken: stoppingToken);
             _logger.LogInformation("🤖 Бот успішно підключений: @{BotUsername} (ID: {BotId})", me.Username, me.Id);
 
-            // Register standard bot commands in Telegram Menu button
+            // Register standard bot commands
             await _botClient.SetMyCommands(new[]
             {
                 new BotCommand { Command = "start", Description = "Головне меню / перезапуск" },
@@ -54,19 +54,50 @@ public class TelegramBotWorker : BackgroundService
                 new BotCommand { Command = "help", Description = "Довідка по боту" }
             }, cancellationToken: stoppingToken);
 
-            var receiverOptions = new ReceiverOptions
+            var useWebhook = _configuration.GetValue<bool>("BotSettings:UseWebhook", false);
+
+            if (useWebhook)
             {
-                AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery },
-                DropPendingUpdates = true
-            };
+                var webhookUrl = _configuration["BotSettings:WebhookUrl"];
+                if (string.IsNullOrWhiteSpace(webhookUrl))
+                {
+                    _logger.LogError("❌ Увімкнено режим Webhook, але не вказано BotSettings:WebhookUrl!");
+                    return;
+                }
 
-            _logger.LogInformation("👂 Початок прослуховування повідомлень Telegram...");
+                var secretToken = _configuration["BotSettings:SecretToken"];
 
-            await _botClient.ReceiveAsync(
-                updateHandler: _botHandler.HandleUpdateAsync,
-                errorHandler: _botHandler.HandleErrorAsync,
-                receiverOptions: receiverOptions,
-                cancellationToken: stoppingToken);
+                _logger.LogInformation("🔗 Реєстрація Telegram Webhook: {Url}...", webhookUrl);
+                await _botClient.SetWebhook(
+                    url: webhookUrl,
+                    secretToken: string.IsNullOrWhiteSpace(secretToken) ? null : secretToken,
+                    allowedUpdates: new[] { UpdateType.Message, UpdateType.CallbackQuery },
+                    dropPendingUpdates: true,
+                    cancellationToken: stoppingToken);
+
+                _logger.LogInformation("✅ Telegram Webhook успішно зареєстровано на {Url}", webhookUrl);
+            }
+            else
+            {
+                _logger.LogInformation("🔄 Запуск у режимі Long Polling (локальна розробка)...");
+
+                // Ensure webhook is deleted before starting long polling
+                await _botClient.DeleteWebhook(dropPendingUpdates: true, cancellationToken: stoppingToken);
+
+                var receiverOptions = new ReceiverOptions
+                {
+                    AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery },
+                    DropPendingUpdates = true
+                };
+
+                _logger.LogInformation("👂 Очікування повідомлень через Long Polling...");
+
+                await _botClient.ReceiveAsync(
+                    updateHandler: _botHandler.HandleUpdateAsync,
+                    errorHandler: _botHandler.HandleErrorAsync,
+                    receiverOptions: receiverOptions,
+                    cancellationToken: stoppingToken);
+            }
         }
         catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
         {
