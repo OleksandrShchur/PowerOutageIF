@@ -1,12 +1,13 @@
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
-using Telegram.Bot.Types;
 using PowerOutageIF.Data;
 using PowerOutageIF.Services;
 using PowerOutageIF.Workers;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Add Controllers
+builder.Services.AddControllers();
 
 // Database configuration (SQL Server)
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
@@ -62,42 +63,7 @@ catch (Exception ex)
     logger.LogError(ex, "Помилка при ініціалізації бази даних SQL Server");
 }
 
-// -------------------------------------------------------------
-// HTTP Endpoints (for MonsterASP / Webhook / Keep-Alive)
-// -------------------------------------------------------------
-
-// Root & Health endpoints (for UptimeRobot / Cron-Job keep-alive)
-app.MapGet("/", () => Results.Text("⚡ PowerOutageIF Telegram Bot Service is running."));
-
-app.MapGet("/health", (IBroadcastQueue queue) => Results.Ok(new
-{
-    status = "Healthy",
-    serverTimeUtc = DateTime.UtcNow,
-    kyivTime = ScheduleTrackerService.GetKyivNow().ToString("yyyy-MM-dd HH:mm:ss"),
-    pendingBroadcasts = queue.PendingCount
-}));
-
-// Telegram Webhook endpoint
-app.MapPost("/api/telegram/webhook", async (
-    HttpContext context,
-    [FromBody] Update update,
-    ITelegramBotClient botClient,
-    ITelegramBotHandler botHandler,
-    IConfiguration config,
-    CancellationToken ct) =>
-{
-    var expectedSecret = config["BotSettings:SecretToken"];
-    if (!string.IsNullOrWhiteSpace(expectedSecret))
-    {
-        var providedSecret = context.Request.Headers["X-Telegram-Bot-Api-Secret-Token"].FirstOrDefault();
-        if (providedSecret != expectedSecret)
-        {
-            return Results.Unauthorized();
-        }
-    }
-
-    await botHandler.HandleUpdateAsync(botClient, update, ct);
-    return Results.Ok();
-});
+// Map Controllers (HealthController, TelegramWebhookController)
+app.MapControllers();
 
 await app.RunAsync();
