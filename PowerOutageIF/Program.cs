@@ -1,10 +1,12 @@
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
+using Telegram.Bot.Types;
 using PowerOutageIF.Data;
 using PowerOutageIF.Services;
 using PowerOutageIF.Workers;
 
-var builder = Host.CreateApplicationBuilder(args);
+var builder = WebApplication.CreateBuilder(args);
 
 // Database configuration (SQL Server)
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
@@ -21,7 +23,8 @@ builder.Services.AddHttpClient<IPrykarpattiaApiClient, PrykarpattiaApiClient>(cl
     client.Timeout = TimeSpan.FromSeconds(20);
 });
 
-// Services
+// Singletons & Services
+builder.Services.AddSingleton<IBroadcastQueue, BroadcastQueue>();
 builder.Services.AddSingleton<IScheduleTrackerService, ScheduleTrackerService>();
 builder.Services.AddSingleton<ITelegramFormatter, TelegramFormatter>();
 builder.Services.AddSingleton<ITelegramBotHandler, TelegramBotHandler>();
@@ -34,19 +37,20 @@ builder.Services.AddSingleton<ITelegramBotClient>(sp =>
     return new TelegramBotClient(token);
 });
 
-// Background Hosted Services
+// Background Workers
+builder.Services.AddHostedService<BroadcastDispatcherWorker>();
 builder.Services.AddHostedService<SchedulePollingWorker>();
 builder.Services.AddHostedService<TelegramBotWorker>();
 
-var host = builder.Build();
+var app = builder.Build();
 
 // Ensure Database & Tables exist on startup
 try
 {
-    var logger = host.Services.GetRequiredService<ILogger<Program>>();
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
     logger.LogInformation("📦 Ініціалізація бази даних SQL Server...");
 
-    var dbFactory = host.Services.GetRequiredService<IDbContextFactory<AppDbContext>>();
+    var dbFactory = app.Services.GetRequiredService<IDbContextFactory<AppDbContext>>();
     await using var db = await dbFactory.CreateDbContextAsync();
     await db.Database.EnsureCreatedAsync();
 
@@ -54,8 +58,46 @@ try
 }
 catch (Exception ex)
 {
-    var logger = host.Services.GetRequiredService<ILogger<Program>>();
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
     logger.LogError(ex, "Помилка при ініціалізації бази даних SQL Server");
 }
 
-await host.RunAsync();
+// -------------------------------------------------------------
+// HTTP Endpoints (for MonsterASP / Webhook / Keep-Alive)
+// -------------------------------------------------------------
+
+// Root & Health endpoints (for UptimeRobot / Cron-Job keep-alive)
+app.MapGet("/", () => Results.Text("⚡ PowerOutageIF Telegram Bot Service is running."));
+
+app.MapGet("/health", (IBroadcastQueue queue) => Results.Ok(new
+{
+    status = "Healthy",
+    serverTimeUtc = DateTime.UtcNow,
+    kyivTime = ScheduleTrackerService.GetKyivNow().ToString("yyyy-MM-dd HH:mm:ss"),
+    pendingBroadcasts = queue.PendingCount
+}));
+
+// Telegram Webhook endpoint
+app.MapPost("/api/telegram/webhook", async (
+    HttpContext context,
+    [FromBody] Update update,
+    ITelegramBotClient botClient,
+    ITelegramBotHandler botHandler,
+    IConfiguration config,
+    CancellationToken ct) =>
+{
+    var expectedSecret = config["BotSettings:SecretToken"];
+    if (!string.IsNullOrWhiteSpace(expectedSecret))
+    {
+        var providedSecret = context.Request.Headers["X-Telegram-Bot-Api-Secret-Token"].FirstOrDefault();
+        if (providedSecret != expectedSecret)
+        {
+            return Results.Unauthorized();
+        }
+    }
+
+    await botHandler.HandleUpdateAsync(botClient, update, ct);
+    return Results.Ok();
+});
+
+await app.RunAsync();

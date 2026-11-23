@@ -2,8 +2,6 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Telegram.Bot;
-using Telegram.Bot.Types.Enums;
 using PowerOutageIF.Data;
 using PowerOutageIF.Models;
 using PowerOutageIF.Services;
@@ -16,7 +14,7 @@ public class SchedulePollingWorker : BackgroundService
     private readonly IPrykarpattiaApiClient _apiClient;
     private readonly IScheduleTrackerService _trackerService;
     private readonly ITelegramFormatter _formatter;
-    private readonly ITelegramBotClient _botClient;
+    private readonly IBroadcastQueue _broadcastQueue;
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
     private readonly ILogger<SchedulePollingWorker> _logger;
     private readonly TimeSpan _pollingInterval;
@@ -26,7 +24,7 @@ public class SchedulePollingWorker : BackgroundService
         IPrykarpattiaApiClient apiClient,
         IScheduleTrackerService trackerService,
         ITelegramFormatter formatter,
-        ITelegramBotClient botClient,
+        IBroadcastQueue broadcastQueue,
         IDbContextFactory<AppDbContext> dbContextFactory,
         IConfiguration configuration,
         ILogger<SchedulePollingWorker> logger)
@@ -34,7 +32,7 @@ public class SchedulePollingWorker : BackgroundService
         _apiClient = apiClient;
         _trackerService = trackerService;
         _formatter = formatter;
-        _botClient = botClient;
+        _broadcastQueue = broadcastQueue;
         _dbContextFactory = dbContextFactory;
         _logger = logger;
 
@@ -46,7 +44,6 @@ public class SchedulePollingWorker : BackgroundService
     {
         _logger.LogInformation("🚀 Служба моніторингу графіків обленерго запущена. Інтервал опитування: {Interval} сек.", _pollingInterval.TotalSeconds);
 
-        // Small initial delay so bot service can initialize
         await Task.Delay(2000, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -67,19 +64,17 @@ public class SchedulePollingWorker : BackgroundService
                     {
                         var changes = await _trackerService.ProcessQueueSchedulesAsync(queueCode, schedules, stoppingToken);
 
-                        // Don't send notifications during first baseline run, just populate state
                         if (!_isFirstRun && changes.Count > 0)
                         {
                             totalChangesDetected += changes.Count;
                             foreach (var change in changes)
                             {
-                                await BroadcastChangeAsync(change, stoppingToken);
+                                await QueueNotificationsForChangeAsync(change, stoppingToken);
                             }
                         }
                     }
 
-                    // Respectful small delay between queue requests
-                    await Task.Delay(300, stoppingToken);
+                    await Task.Delay(200, stoppingToken);
                 }
 
                 if (_isFirstRun)
@@ -90,7 +85,8 @@ public class SchedulePollingWorker : BackgroundService
                 else
                 {
                     var duration = DateTime.UtcNow - cycleStart;
-                    _logger.LogInformation("✨ Перевірка завершена за {Duration:F1} сек. Виявлено нових змін: {Changes}", duration.TotalSeconds, totalChangesDetected);
+                    _logger.LogInformation("✨ Перевірка завершена за {Duration:F1} сек. Виявлено нових змін: {Changes}. У черзі на відправку: {Pending}", 
+                        duration.TotalSeconds, totalChangesDetected, _broadcastQueue.PendingCount);
                 }
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
@@ -111,7 +107,7 @@ public class SchedulePollingWorker : BackgroundService
         _logger.LogInformation("🛑 Служба моніторингу графіків зупинена.");
     }
 
-    private async Task BroadcastChangeAsync(ScheduleChangeResult change, CancellationToken cancellationToken)
+    private async Task QueueNotificationsForChangeAsync(ScheduleChangeResult change, CancellationToken cancellationToken)
     {
         try
         {
@@ -119,11 +115,12 @@ public class SchedulePollingWorker : BackgroundService
 
             var subscribedUsers = await dbContext.Users
                 .Where(u => u.SubscribedQueue == change.QueueCode && u.NotificationsEnabled)
+                .Select(u => new { u.Id, u.SilentModeAtNight })
                 .ToListAsync(cancellationToken);
 
             if (subscribedUsers.Count == 0)
             {
-                _logger.LogInformation("📢 Зміна в черзі {Queue}, але немає підписаних користувачів.", change.QueueCode);
+                _logger.LogInformation("📢 Зміна в черзі {Queue}, але немає активних підписників.", change.QueueCode);
                 return;
             }
 
@@ -131,43 +128,20 @@ public class SchedulePollingWorker : BackgroundService
             var nowKyiv = ScheduleTrackerService.GetKyivNow();
             bool isNightTime = nowKyiv.Hour >= 23 || nowKyiv.Hour < 7;
 
-            _logger.LogInformation("📢 Розсилка сповіщення для черги {Queue} ({Count} користувачів). Нічний час: {IsNight}",
-                change.QueueCode, subscribedUsers.Count, isNightTime);
+            var notifications = subscribedUsers.Select(u => new QueuedNotification(
+                ChatId: u.Id,
+                Text: messageText,
+                DisableNotification: isNightTime && u.SilentModeAtNight
+            ));
 
-            int sentCount = 0;
-            foreach (var user in subscribedUsers)
-            {
-                if (cancellationToken.IsCancellationRequested) break;
+            _broadcastQueue.EnqueueRange(notifications);
 
-                bool disableSound = isNightTime && user.SilentModeAtNight;
-
-                try
-                {
-                    await _botClient.SendMessage(
-                        chatId: user.Id,
-                        text: messageText,
-                        parseMode: ParseMode.Html,
-                        disableNotification: disableSound,
-                        replyMarkup: TelegramKeyboards.GetNotificationActionKeyboard(),
-                        cancellationToken: cancellationToken);
-
-                    sentCount++;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning("Не вдалося надіслати сповіщення користувачу {UserId}: {Error}", user.Id, ex.Message);
-                }
-
-                // Telegram rate limit friendly delay
-                await Task.Delay(50, cancellationToken);
-            }
-
-            _logger.LogInformation("✅ Сповіщення для черги {Queue} успішно надіслано {Sent}/{Total} користувачам.",
-                change.QueueCode, sentCount, subscribedUsers.Count);
+            _logger.LogInformation("📥 Додано до черги розсилки: {Count} повідомлень для підчерги {Queue}. Нічний режим: {IsNight}",
+                subscribedUsers.Count, change.QueueCode, isNightTime);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Помилка при розсилці сповіщень для черги {Queue}", change.QueueCode);
+            _logger.LogError(ex, "Помилка додавання повідомлень до черги для черги {Queue}", change.QueueCode);
         }
     }
 }
