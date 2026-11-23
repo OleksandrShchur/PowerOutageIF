@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PowerOutageIF.Tests/PowerOutageIF.Tests.csproj" />
+  <Project Path="PowerOutageIF/PowerOutageIF.csproj" />
+</Solution>
